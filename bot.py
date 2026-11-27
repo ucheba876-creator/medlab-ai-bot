@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ from contextlib import closing, suppress
 from datetime import date, datetime, timezone
 
 import anthropic
+import fitz
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
@@ -25,6 +27,12 @@ MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 DB = "medlab.db"
 DAILY_LIMIT = 25
 MB = 1024 * 1024
+PDF_MAX_MB = 15
+IMG_MAX_MB = 5
+PDF_TEXT_MAX_PAGES = 10
+PDF_VISION_MAX_PAGES = 4
+PDF_TEXT_MIN_CHARS = 150
+
 router = Router()
 ai = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=120)
 
@@ -211,9 +219,11 @@ def txt(x):
     return str(x or "").strip()
 
 
-def build_report(u, data, vals, prev_vals, extras):
+def build_report(u, data, vals, prev_vals, extras, notice=""):
     lang, g = u["lang"], u["gender"]
     parts = ["🔬 MedLab AI"]
+    if notice:
+        parts.append(notice)
     if vals:
         line = " | ".join(f"{status(c, g, vals[c])} {c} {fmt(vals[c])}" for c in CODES if c in vals)
         legend = L(lang, "🟢 қалыпты · 🟡 шекаралық · 🔴 назар аудару қажет", "🟢 норма · 🟡 пограничное · 🔴 требует внимания")
@@ -310,7 +320,7 @@ def guide(lang):
     return L(
         lang,
         "✅ Тіркелу аяқталды!\n\n📋 Қалай қолдану керек:\n"
-        "1️⃣ Талдау бланкісін жіберіңіз: фото, PNG/JPG/WEBP файлы (5 МБ дейін) немесе PDF (10 МБ дейін).\n"
+        f"1️⃣ Талдау бланкісін жіберіңіз: фото, PNG/JPG/WEBP файлы ({IMG_MAX_MB} МБ дейін) немесе PDF ({PDF_MAX_MB} МБ дейін).\n"
         "📸 Фото жоғары сапада, жарық және сандар анық көрінетіндей болсын.\n"
         "2️⃣ Мен 10 негізгі көрсеткішті (HGB, RBC, WBC, PLT, ЭТЖ, глюкоза, АЛТ, АСТ, ферритин, D дәрумені) табамын, 🚦 бағдаршам көрсетіп, қарапайым тілмен түсіндіремін.\n"
         "3️⃣ Көрсеткіштерді мәтінмен де жазуға болады, мысалы: «гемоглобин 105, ферритин 8».\n"
@@ -318,7 +328,7 @@ def guide(lang):
         "⌨️ Командалар:\n/lang — тілді ауыстыру\n/delete — профиль мен тарихты өшіру\n/stats — статистика\n/help — анықтама\n\n"
         "⚠️ Бұл анықтамалық ақпарат, медициналық диагноз емес.",
         "✅ Регистрация завершена!\n\n📋 Как пользоваться:\n"
-        "1️⃣ Отправьте бланк анализов: фото, файл PNG/JPG/WEBP (до 5 МБ) или PDF (до 10 МБ).\n"
+        f"1️⃣ Отправьте бланк анализов: фото, файл PNG/JPG/WEBP (до {IMG_MAX_MB} МБ) или PDF (до {PDF_MAX_MB} МБ).\n"
         "📸 Фото должно быть чётким, при хорошем освещении, чтобы цифры легко читались.\n"
         "2️⃣ Я найду 10 базовых показателей (HGB, RBC, WBC, PLT, СОЭ, глюкоза, АЛТ, АСТ, ферритин, витамин D), покажу светофор 🚦 и объясню простыми словами.\n"
         "3️⃣ Показатели можно написать и текстом, например: «гемоглобин 105, ферритин 8».\n"
@@ -331,10 +341,12 @@ def guide(lang):
 def help_txt(lang):
     return L(
         lang,
-        "ℹ️ MedLab AI — талдауды түсіндіретін оқу көмекшісі.\nБланк (фото, PNG/JPG/WEBP, PDF) жіберіңіз немесе көрсеткіштер туралы сұраңыз.\n"
+        "ℹ️ MedLab AI — талдауды түсіндіретін оқу көмекшісі.\n"
+        f"Бланк (фото, PNG/JPG/WEBP {IMG_MAX_MB} МБ дейін, PDF {PDF_MAX_MB} МБ дейін) жіберіңіз немесе көрсеткіштер туралы сұраңыз.\n"
         "/lang — тіл · /delete — деректерді өшіру · /stats — статистика · /start — қайта тіркелу\n"
         "Күнделікті лимит: 25 сұраныс.",
-        "ℹ️ MedLab AI — учебный помощник по расшифровке анализов.\nОтправьте бланк (фото, PNG/JPG/WEBP, PDF) или задайте вопрос по показателям.\n"
+        "ℹ️ MedLab AI — учебный помощник по расшифровке анализов.\n"
+        f"Отправьте бланк (фото, PNG/JPG/WEBP до {IMG_MAX_MB} МБ, PDF до {PDF_MAX_MB} МБ) или задайте вопрос по показателям.\n"
         "/lang — язык · /delete — удалить данные · /stats — статистика · /start — пройти регистрацию заново\n"
         "Дневной лимит: 25 запросов.",
     )
@@ -346,13 +358,13 @@ def not_ready(lang):
 
 
 def unsupported(lang):
-    return L(lang, "Бұл форматты өңдей алмаймын. Қолдау көрсетіледі: фото, PNG/JPG/WEBP (5 МБ дейін) немесе PDF (10 МБ дейін). DOCX, бейне, стикер және дауыстық хабарлама қабылданбайды. Бланктің фотосын немесе PDF файлын жіберіңіз.",
-             "Не могу обработать этот формат. Поддерживаются: фото, PNG/JPG/WEBP (до 5 МБ) или PDF (до 10 МБ). DOCX, видео, стикеры и голосовые не принимаются. Отправьте фото бланка или PDF-файл.")
+    return L(lang, f"Бұл форматты өңдей алмаймын. Қолдау көрсетіледі: фото, PNG/JPG/WEBP ({IMG_MAX_MB} МБ дейін) немесе PDF ({PDF_MAX_MB} МБ дейін). DOCX, бейне, стикер және дауыстық хабарлама қабылданбайды. Бланктің фотосын немесе PDF файлын жіберіңіз.",
+             f"Не могу обработать этот формат. Поддерживаются: фото, PNG/JPG/WEBP (до {IMG_MAX_MB} МБ) или PDF (до {PDF_MAX_MB} МБ). DOCX, видео, стикеры и голосовые не принимаются. Отправьте фото бланка или PDF-файл.")
 
 
 def too_big(lang):
-    return L(lang, "Файл тым үлкен: сурет — 5 МБ, PDF — 10 МБ дейін. Файлды кішірейтіп, қайта жіберіңіз.",
-             "Файл слишком большой: изображение — до 5 МБ, PDF — до 10 МБ. Уменьшите файл и отправьте снова.")
+    return L(lang, f"Файл тым үлкен: сурет — {IMG_MAX_MB} МБ, PDF — {PDF_MAX_MB} МБ дейін. Файлды кішірейтіп, қайта жіберіңіз.",
+             f"Файл слишком большой: изображение — до {IMG_MAX_MB} МБ, PDF — до {PDF_MAX_MB} МБ. Уменьшите файл и отправьте снова.")
 
 
 def limit_txt(lang):
@@ -396,6 +408,46 @@ async def send_long(m, text, kb=None):
         await m.answer(p, reply_markup=kb if i == len(parts) - 1 else None)
 
 
+# ---------- PDF hybrid extractor ----------
+def extract_pdf_hybrid(pdf_bytes):
+    """
+    Гибридная обработка PDF:
+    1) Извлекает текстовый слой с первых PDF_TEXT_MAX_PAGES страниц.
+       Если длина текста после strip() >= PDF_TEXT_MIN_CHARS — возвращает ("text", text, total_pages).
+    2) Иначе рендерит первые PDF_VISION_MAX_PAGES страниц в JPEG (Matrix 1.6, quality=80)
+       с немедленным освобождением памяти после каждой страницы — возвращает ("images", [b64, ...], total_pages).
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        total_pages = len(doc)
+        text_chunks = []
+        for idx in range(min(total_pages, PDF_TEXT_MAX_PAGES)):
+            page = doc.load_page(idx)
+            page_txt = page.get_text("text")
+            if page_txt:
+                text_chunks.append(page_txt)
+        full_text = "\n".join(text_chunks).strip()
+        if len(full_text) >= PDF_TEXT_MIN_CHARS:
+            return "text", full_text, total_pages
+
+        images_b64 = []
+        mat = fitz.Matrix(1.6, 1.6)
+        for idx in range(min(total_pages, PDF_VISION_MAX_PAGES)):
+            page = doc.load_page(idx)
+            pix = None
+            try:
+                pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
+                jpg_bytes = pix.tobytes("jpeg", jpg_quality=80)
+                images_b64.append(base64.standard_b64encode(jpg_bytes).decode("ascii"))
+            finally:
+                pix = None
+                gc.collect()
+        return "images", images_b64, total_pages
+    finally:
+        doc.close()
+        gc.collect()
+
+
 # ---------- Claude ----------
 SCHEMA = (
     '{"is_lab_report":bool,"intent":"lab|question|offtopic",'
@@ -408,8 +460,9 @@ def build_system(u, prev, is_file):
     g, lang = u["gender"], u["lang"]
     last = ("Последний анализ: " + status_text(load_vals(prev), g)) if prev else "Прошлых анализов нет."
     mode = (
-        "Вход: файл (изображение или PDF). Если это бланк лабораторных анализов: is_lab_report=true, intent=\"lab\". "
-        "Если на изображении/в документе НЕ бланк анализов (скриншот, мем, пейзаж, чек, фото предмета и т.п.): "
+        "Вход: файл (изображение/изображения страниц или извлечённый текст PDF-бланка). "
+        "Если это бланк лабораторных анализов: is_lab_report=true, intent=\"lab\". "
+        "Если в файле НЕ бланк анализов (скриншот, мем, пейзаж, чек, фото предмета, договор и т.п.): "
         "ВСЕГДА верни строго валидный компактный JSON с is_lab_report=false, intent=\"offtopic\" и пустыми текстовыми полями."
         if is_file else
         "Вход: текст (на любом языке — казахском, русском или английском). Классификация intent (СТРОГО соблюдай):\n"
@@ -758,7 +811,7 @@ async def on_memo(cb: CallbackQuery):
     await send_long(cb.message, "🩺 " + L(lang, "ДӘРІГЕРГЕ ШПАРГАЛКА", "ШПАРГАЛКА ВРАЧУ") + "\n\n" + out + "\n\n" + DISC(lang))
 
 
-async def analyze(m: Message, u, content, is_file):
+async def analyze(m: Message, u, content, is_file, notice=""):
     uid, lang = u["user_id"], u["lang"]
     wait = await m.answer(L(lang, "⏳ Талдап жатырмын, күте тұрыңыз...", "⏳ Анализирую, подождите..."))
     prev = last_analysis(uid)
@@ -825,7 +878,7 @@ async def analyze(m: Message, u, content, is_file):
             await m.answer(L(lang, "Бланктен көрсеткіштер табылмады. Анығырақ фото немесе PDF жіберіңіз, не мәндерді мәтінмен жазыңыз.",
                              "Показатели в бланке не найдены. Отправьте более чёткое фото или PDF либо напишите значения текстом."))
             return
-        report = build_report(u, data, vals, load_vals(prev), extras)
+        report = build_report(u, data, vals, load_vals(prev), extras, notice=notice)
         if vals:
             q("INSERT INTO analyses(user_id, created_at, values_json) VALUES(?,?,?)",
               (uid, datetime.now(timezone.utc).isoformat(timespec="seconds"), json.dumps(vals)))
@@ -841,12 +894,13 @@ async def on_file(m: Message, media, fid, size):
         await m.answer(not_ready(lang))
         return
     pdf = media == "application/pdf"
-    if size > (10 if pdf else 5) * MB:
+    if size > (PDF_MAX_MB if pdf else IMG_MAX_MB) * MB:
         await m.answer(too_big(lang))
         return
     if not has_quota(uid):
         await m.answer(limit_txt(lang))
         return
+
     with closing(io.BytesIO()) as buf:
         try:
             await m.bot.download(fid, destination=buf)
@@ -854,8 +908,65 @@ async def on_file(m: Message, media, fid, size):
             log.exception("Telegram file download error (user_id=%s, file_id=%s)", uid, fid)
             await m.answer(err_txt(lang))
             return
-        b64 = base64.standard_b64encode(buf.getbuffer()).decode("ascii")
-    block = {"type": "document" if pdf else "image", "source": {"type": "base64", "media_type": media, "data": b64}}
+        raw_bytes = buf.getvalue()
+
+    if pdf:
+        try:
+            mode, payload, total_pages = await asyncio.to_thread(extract_pdf_hybrid, raw_bytes)
+        except Exception:
+            log.exception("PDF hybrid processing failed (user_id=%s, file_id=%s)", uid, fid)
+            await m.answer(err_txt(lang))
+            return
+        finally:
+            raw_bytes = None
+            gc.collect()
+
+        log.info("PDF parsed (user_id=%s, mode=%s, total_pages=%d)", uid, mode, total_pages)
+        notice = ""
+        if mode == "text":
+            if total_pages > PDF_TEXT_MAX_PAGES:
+                notice = L(
+                    lang,
+                    f"ℹ️ Ескерту: PDF құжатында {total_pages} бет бар, алғашқы {PDF_TEXT_MAX_PAGES} беттің мәтіні талданды.",
+                    f"ℹ️ Примечание: в PDF-документе {total_pages} стр., проанализирован текст первых {PDF_TEXT_MAX_PAGES} страниц.",
+                )
+            lang_tail = (
+                "Бланкідегі мәтін орысша болса да, JSON ішіндегі explanation, connections, specialist өрістерін 100% ТЕК ҚАЗАҚ ТІЛІНДЕ жаз! Орыс сөздерін қолданба."
+                if lang == "kk" else
+                "Верни JSON строго на русском языке."
+            )
+            pdf_prompt = (
+                "Проанализируй все найденные лабораторные показатели из извлечённого текста PDF-бланка анализов и верни JSON.\n"
+                f"{lang_tail}\n\n"
+                f"Текст PDF-бланка:\n{payload[:25000]}"
+            )
+            await analyze(m, u, [{"type": "text", "text": pdf_prompt}], True, notice=notice)
+        else:
+            if not payload:
+                await m.answer(err_txt(lang))
+                return
+            if total_pages > PDF_VISION_MAX_PAGES:
+                notice = L(
+                    lang,
+                    f"⚠️ Ескерту: PDF сканерленген суреттерден тұрады ({total_pages} бет). Жүктемені азайту үшін тек алғашқы {PDF_VISION_MAX_PAGES} бет тексерілді.",
+                    f"⚠️ Внимание: PDF состоит из отсканированных изображений ({total_pages} стр.). Проверены только первые {PDF_VISION_MAX_PAGES} страницы.",
+                )
+            blocks = [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}}
+                for img_b64 in payload
+            ]
+            file_prompt = (
+                "Бланкідегі мәтін орысша болса да, JSON ішіндегі explanation, connections, specialist өрістерін 100% ТЕК ҚАЗАҚ ТІЛІНДЕ жаз! Орыс сөздерін қолданба."
+                if lang == "kk" else
+                "Верни JSON строго на русском языке."
+            )
+            blocks.append({"type": "text", "text": file_prompt})
+            await analyze(m, u, blocks, True, notice=notice)
+        return
+
+    b64 = base64.standard_b64encode(raw_bytes).decode("ascii")
+    raw_bytes = None
+    block = {"type": "image", "source": {"type": "base64", "media_type": media, "data": b64}}
     file_prompt = (
         "Бланкідегі мәтін орысша болса да, JSON ішіндегі explanation, connections, specialist өрістерін 100% ТЕК ҚАЗАҚ ТІЛІНДЕ жаз! Орыс сөздерін қолданба."
         if lang == "kk" else
