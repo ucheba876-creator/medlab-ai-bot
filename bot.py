@@ -249,8 +249,10 @@ def build_report(u, data, vals, prev_vals, extras):
     ]
     for key, label in labels:
         t = txt(data.get(key))
-        if not t and key == "sources":
-            t = SRC_FALLBACK
+        if key == "sources":
+            t = re.sub(r"^(?:📚\s*)?(?:Дереккөздер|Источники)\s*:\s*", "", t, flags=re.IGNORECASE).strip()
+            if not t:
+                t = SRC_FALLBACK
         if t:
             parts.append(f"{label}\n{t}")
     parts.append(DISC(lang))
@@ -453,7 +455,8 @@ def build_system(u, prev, is_file):
         "- extra_markers: прочие показатели (name, value с ед.), без норм.\n"
         f"- {mode}\n"
         "- Для lab (кратко, без воды): explanation — 3–5 предложений простыми словами об отклонениях и визите к врачу; "
-        "connections — применимые связи из справочника или \"\"; specialist — нужный врач; sources — 2–3 источника из списка.\n"
+        "connections — применимые связи из справочника или \"\"; specialist — нужный врач; "
+        "sources — 2–3 источника из списка (возвращай ТОЛЬКО сам перечень источников, БЕЗ слов «Дереккөздер:» / «Источники:» в начале, так как заголовок «📚 ДЕРЕККӨЗДЕР» / «📚 ИСТОЧНИКИ» программа подставит сама).\n"
         "- Для question (в поле answer, остальные текстовые поля пустые):\n"
         "  • Если приветствие: дружелюбно поздоровайся и напомни, что готов разобрать бланк (фото, PDF или цифры текстом) либо ответить на вопрос по анализам.\n"
         "  • Если вопрос о функциях бота: кратко и структурно перечисли возможности (разбор 10 базовых показателей, светофор 🟢/🟡/🔴, динамика «Было / Стало», шпаргалка к врачу, ответы по показателям).\n"
@@ -843,7 +846,12 @@ async def on_file(m: Message, media, fid, size):
             return
         b64 = base64.standard_b64encode(buf.getbuffer()).decode("ascii")
     block = {"type": "document" if pdf else "image", "source": {"type": "base64", "media_type": media, "data": b64}}
-    await analyze(m, u, [block, {"type": "text", "text": "JSON"}], True)
+    file_prompt = (
+        "Бланкідегі мәтін орысша болса да, JSON ішіндегі explanation, connections, specialist өрістерін 100% ТЕК ҚАЗАҚ ТІЛІНДЕ жаз! Орыс сөздерін қолданба."
+        if lang == "kk" else
+        "Верни JSON строго на русском языке."
+    )
+    await analyze(m, u, [block, {"type": "text", "text": file_prompt}], True)
 
 
 @router.message(F.photo)
