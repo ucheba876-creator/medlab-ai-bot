@@ -656,6 +656,32 @@ async def send_text(message: Message, text: str, reply_markup=None) -> None:
         await safe_answer(message, part, markup)
 
 
+def describe_error(exc: BaseException) -> str:
+    """Короткое описание ошибки для логов: класс, HTTP-статус и текст от API."""
+    status = getattr(exc, "status_code", None)
+    msg = str(getattr(exc, "message", "") or exc)
+    return f"{type(exc).__name__}" + (f" [{status}]" if status else "") + f": {msg[:300]}"
+
+
+def error_code(exc: BaseException) -> str:
+    """Короткий код ошибки для сообщения пользователю, напр. 'AuthenticationError 401'."""
+    status = getattr(exc, "status_code", None)
+    return type(exc).__name__ + (f" {status}" if status else "")
+
+
+def err_text(t: dict, exc: BaseException) -> str:
+    """Общее сообщение об ошибке + код, чтобы причину было видно без чтения логов."""
+    return f"{t['error']} (код: {error_code(exc)})"
+
+
+def is_file_problem(exc: BaseException) -> bool:
+    """True, если 400 от API действительно про файл, а не про баланс/ключ/модель."""
+    msg = str(getattr(exc, "message", "") or exc).lower()
+    if any(w in msg for w in ("credit", "balance", "billing", "api key", "model", "quota")):
+        return False
+    return any(w in msg for w in ("image", "pdf", "document", "media", "base64", "page", "size"))
+
+
 async def drop_message(msg: Message | None) -> None:
     if msg is None:
         return
@@ -903,12 +929,16 @@ async def respond_via_claude(
             await send_text(message, answer)
         else:  # cheat
             await send_text(message, answer)
-    except BadRequestError:
-        log.exception("Claude API отклонил запрос")
-        await say(message, t["file_unreadable"] if from_file else t["error"])
-    except Exception:
-        log.exception("Bot error")
-        await say(message, t["error"])
+    except BadRequestError as e:
+        log.exception("Claude API отклонил запрос: %s", e)
+        # «файл нечитаем» показываем только если проблема правда в файле, а не в счёте/ключе/модели
+        if from_file and is_file_problem(e):
+            await say(message, t["file_unreadable"])
+        else:
+            await say(message, err_text(t, e))
+    except Exception as e:
+        log.exception("Bot error: %s", describe_error(e))
+        await say(message, err_text(t, e))
     finally:
         await drop_message(wait_msg)
 
@@ -981,9 +1011,9 @@ async def process_attachment(
                 message, bot, p, uid, content, t["reminder_analysis"], history_text,
                 mode="analysis", from_file=True,
             )
-        except Exception:
-            log.exception("Bot error")
-            await say(message, t["error"])
+        except Exception as e:
+            log.exception("Bot error: %s", describe_error(e))
+            await say(message, err_text(t, e))
 
 
 # ---------------------------------------------------------------------------
@@ -1171,9 +1201,9 @@ async def on_text(message: Message, bot: Bot):
                 await respond_via_claude(
                     message, bot, p, uid, text, t["reminder_question"], text, mode="question",
                 )
-        except Exception:
-            log.exception("Bot error")
-            await say(message, t["error"])
+        except Exception as e:
+            log.exception("Bot error: %s", describe_error(e))
+            await say(message, err_text(t, e))
 
 
 @router_dp.message()
@@ -1240,6 +1270,22 @@ def load_norms() -> str:
     return ""
 
 
+async def check_claude_api() -> None:
+    """Проверка при старте: ключ, модель и баланс. Результат — в лог Render (бот не падает)."""
+    try:
+        r = await client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=8,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        log.info("Проверка Claude API: OK (модель %s, stop_reason=%s)", MODEL_NAME, r.stop_reason)
+    except Exception as e:
+        log.error("Проверка Claude API: ОШИБКА — %s", describe_error(e))
+        log.error(
+            "Проверьте: ANTHROPIC_API_KEY, доступ ключа к модели %s, баланс аккаунта Anthropic.", MODEL_NAME
+        )
+
+
 async def main() -> None:
     global NORMS_TEXT
 
@@ -1249,6 +1295,7 @@ async def main() -> None:
         raise SystemExit("Не задана переменная окружения ANTHROPIC_API_KEY")
 
     NORMS_TEXT = load_norms()
+    await check_claude_api()
 
     bot = Bot(token=TELEGRAM_TOKEN)
     runner = await start_web_server()
