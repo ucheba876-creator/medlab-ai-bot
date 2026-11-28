@@ -25,6 +25,7 @@ from clinical_data import (
     UNIT_CONVERSION_PROMPT,
     clean_values,
     fmt_val,
+    is_base_marker_name,
     marker_name,
     marker_range,
     marker_status,
@@ -44,6 +45,7 @@ from db import (
     load_vals,
     q,
     ready,
+    reset_all_stats,
     save_analysis,
     save_feedback,
     save_feedback_comment,
@@ -56,6 +58,11 @@ log = logging.getLogger("medlab")
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN") or ""
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY") or ""
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 DAILY_LIMIT = 25
 MB = 1024 * 1024
 PDF_MAX_MB = 15
@@ -89,12 +96,20 @@ def L(lang, kk, ru):
     return kk if lang == "kk" else ru if lang == "ru" else f"{kk}\n\n{ru}"
 
 
+def is_admin(uid):
+    return (uid in ADMIN_IDS) if ADMIN_IDS else True
+
+
 def clean_extras(raw):
     out = []
     if isinstance(raw, list):
         for e in raw:
             if isinstance(e, dict) and e.get("name"):
-                out.append((str(e["name"]).strip(), str(e.get("value", "")).strip()))
+                name = str(e["name"]).strip()
+                val = str(e.get("value", "")).strip()
+                # Отсекаем любые базовые маркеры из списка 28, чтобы они не дублировались в доп. блоке
+                if name and not is_base_marker_name(name):
+                    out.append((name, val))
     return out[:30]
 
 
@@ -112,7 +127,8 @@ def build_report(u, data, vals, prev_vals, extras, notice=""):
     if vals:
         line = " | ".join(f"{marker_status(c, g, vals[c])} {c} {fmt_val(vals[c])}" for c in CODES if c in vals)
         legend = L(lang, "🟢 қалыпты · 🟡 шекаралық · 🔴 назар аудару қажет", "🟢 норма · 🟡 пограничное · 🔴 требует внимания")
-        parts.append(f"🚦 БАҒДАРШАМ / СВЕТОФОР\n{line}\n{legend}")
+        traffic_head = L(lang, "🚦 БАҒДАРШАМ", "🚦 СВЕТОФОР")
+        parts.append(f"{traffic_head}\n{line}\n{legend}")
         det = []
         norm_lbl = "қалыпты" if lang == "kk" else "норма"
         for c in CODES:
@@ -125,8 +141,8 @@ def build_report(u, data, vals, prev_vals, extras, notice=""):
     else:
         parts.append(L(
             lang,
-            f"ℹ️ Бланктен {len(CODES)} негізгі көрсеткіштің ешқайсысы табылмады.",
-            f"ℹ️ Ни одного из {len(CODES)} базовых показателей в бланке не найдено.",
+            f"ℹ️ Бланктен {len(CODES)} негізгі көрсеткіштің ешқайсысы сенімді түрде табылмады.",
+            f"ℹ️ Ни одного из {len(CODES)} базовых показателей в бланке не удалось распознать однозначно.",
         ))
     cmp = []
     for c in CODES:
@@ -135,7 +151,8 @@ def build_report(u, data, vals, prev_vals, extras, notice=""):
             arrow = "↑" if n > o else "↓" if n < o else "="
             cmp.append(f"{c}: {fmt_val(o)} {marker_status(c, g, o)} → {fmt_val(n)} {marker_status(c, g, n)} {arrow}")
     if cmp:
-        parts.append("📈 БОЛДЫ / ҚАЗІР (БЫЛО / СТАЛО)\n" + "\n".join(cmp))
+        cmp_head = L(lang, "📈 БОЛДЫ / ҚАЗІР", "📈 БЫЛО / СТАЛО")
+        parts.append(cmp_head + "\n" + "\n".join(cmp))
     if extras:
         head = L(lang, "➕ ҚОСЫМША КӨРСЕТКІШТЕР (бланктен):", "➕ ДОПОЛНИТЕЛЬНЫЕ ПОКАЗАТЕЛИ (из бланка):")
         note = L(
@@ -222,7 +239,7 @@ def guide(lang):
         f"2️⃣ Мен {len(CODES)} негізгі көрсеткішті (ЖҚА, темір/ферритин, B12/фолий, D дәрумені, глюкоза/HbA1c, бауыр АЛТ/АСТ/билирубин, бүйрек креатинин/мочевина, ақуыз, липидограмма, СРА, қалқанша без ТТГ/бос Т4) табамын, 🚦 бағдаршам көрсетіп, түсіндіремін.\n"
         "3️⃣ Көрсеткіштерді мәтінмен де жазуға болады, мысалы: «гемоглобин 105, ферритин 8, ТТГ 4.8».\n"
         "4️⃣ Көрсеткіштер туралы сұрақ қойыңыз — соңғы талдауыңызды ескеріп жауап беремін.\n\n"
-        "⌨️ Командалар:\n/lang — тілді ауыстыру\n/delete — профиль мен тарихты өшіру\n/stats — статистика\n/help — анықтама\n\n"
+        "⌨️ Командалар:\n/lang — тілді ауыстыру\n/delete — жеке деректер мен тарихты өшіру\n/help — анықтама\n\n"
         "⚠️ Бұл білім беру-анықтамалық ақпарат, медициналық диагноз емес.",
         "✅ Регистрация завершена!\n\n📋 Как пользоваться:\n"
         f"1️⃣ Отправьте бланк анализов: фото, файл PNG/JPG/WEBP (до {IMG_MAX_MB} МБ) или PDF (до {PDF_MAX_MB} МБ).\n"
@@ -230,7 +247,7 @@ def guide(lang):
         f"2️⃣ Я найду {len(CODES)} базовых показателей (ОАК, железо/ферритин, B12/фолиевая, витамин D, глюкоза/HbA1c, печень АЛТ/АСТ/билирубин, почки креатинин/мочевина, общий белок/альбумин, липидограмма, СРБ, щитовидная железа ТТГ/св. Т4), покажу светофор 🚦 и объясню понятным языком.\n"
         "3️⃣ Показатели можно написать и текстом, например: «гемоглобин 105, ферритин 8, ТТГ 4.8».\n"
         "4️⃣ Задавайте вопросы по показателям — отвечу с учётом вашего последнего анализа.\n\n"
-        "⌨️ Команды:\n/lang — сменить язык\n/delete — удалить профиль и историю\n/stats — статистика\n/help — справка\n\n"
+        "⌨️ Команды:\n/lang — сменить язык\n/delete — удалить профиль и историю\n/help — справка\n\n"
         "⚠️ Это образовательно-справочная информация, а не медицинский диагноз.",
     )
 
@@ -240,11 +257,11 @@ def help_txt(lang):
         lang,
         "ℹ️ MedLab AI — талдауды түсіндіретін көмекші.\n"
         f"Бланк (фото, PNG/JPG/WEBP {IMG_MAX_MB} МБ дейін, PDF {PDF_MAX_MB} МБ дейін) жіберіңіз немесе көрсеткіштер туралы сұраңыз.\n"
-        "/lang — тіл · /delete — деректерді өшіру · /stats — статистика · /start — қайта тіркелу\n"
+        "/lang — тіл · /delete — деректерді өшіру · /start — қайта тіркелу\n"
         "Күнделікті лимит: 25 сұраныс.",
         "ℹ️ MedLab AI — образовательный помощник по расшифровке анализов.\n"
         f"Отправьте бланк (фото, PNG/JPG/WEBP до {IMG_MAX_MB} МБ, PDF до {PDF_MAX_MB} МБ) или задайте вопрос по показателям.\n"
-        "/lang — язык · /delete — удалить данные · /stats — статистика · /start — пройти регистрацию заново\n"
+        "/lang — язык · /delete — удалить данные · /start — пройти регистрацию заново\n"
         "Дневной лимит: 25 запросов.",
     )
 
@@ -374,10 +391,9 @@ def build_system(u, prev, is_file):
         lang_rule = (
             f"ПРОФИЛЬ ТІЛІ: ҚАЗАҚ ТІЛІ (lang=kk). {KK_STRICT} "
             "ЖАУАП ТІЛІ ТЕК ПРОФИЛЬ БАПТАУЫМЕН АНЫҚТАЛАДЫ (lang=kk), КІРІС ХАБАРЛАМАНЫҢ НЕМЕСЕ ФОТО/PDF БЛАНКТІҢ ТІЛІНЕ ТӘУЕЛДІ ЕМЕС! "
-            "Егер фото/PDF бланк орыс немесе ағылшын тілінде болса да, барлық мәліметті аударып, explanation, connections, specialist, sources және answer өрістерін 100% ҚАЗАҚ ТІЛІНДЕ жаз. "
-            "Егер суретте талдау бланкісі болмаса немесе сұрақ орыс/ағылшын тілінде жазылса да (мысалы, «дай рецепт панкейков»), бәрібір қатаң валидті JSON қайтар: "
-            "оффтоп/бөтен сурет болса is_lab_report=false, intent=\"offtopic\" (мәтіндік өрістер бос), ал сұрақ болса intent=\"question\" және answer өрісін 100% ҚАЗАҚ ТІЛІНДЕ жаз. "
-            "Тілі таза, табиғи әрі сауатты болсын, машиналық калькаларсыз жаз («талдаулар», «аналар» емес; «дәрігер», «көрсеткіштер»). "
+            "Пайдаланушы хабарламаны орысша жазса да («гемоглобин 105, ферритин 8») немесе бланк орыс/ағылшын тілінде болса да, "
+            "explanation, connections, specialist, sources және answer өрістерін 100% ТЕК ҚАЗАҚ ТІЛІНДЕ жаз! Бірде-бір орыс сөйлемі болмасын! "
+            "Тілі таза, табиғи әрі сауатты болсын («талдаулар», «аналар» емес; «дәрігер», «көрсеткіштер»). "
             "Дереккөздердің түсіндірмесін де қазақша жаз (мысалы, «• Көрсеткіштер физиологиясы мен референстер: Tietz Fundamentals of Clinical Chemistry...»)."
         )
         lang_bottom = f"\n{KK_STRICT}"
@@ -387,7 +403,7 @@ def build_system(u, prev, is_file):
         lang_rule = (
             "ЯЗЫК ПРОФИЛЯ: РУССКИЙ (lang=ru). Все текстовые поля пиши СТРОГО на 100% грамотном русском языке без смешивания языков (кроме кодов маркеров, ед. изм. и англоязычных названий/доменов источников). "
             "ЯЗЫК ОТВЕТА ОПРЕДЕЛЯЕТСЯ ТОЛЬКО НАСТРОЙКОЙ ПРОФИЛЯ (lang=ru), А НЕ ЯЗЫКОМ ВХОДЯЩЕГО СООБЩЕНИЯ ИЛИ ФОТО/PDF! "
-            "Даже если пользователь написал вопрос на казахском (например, «қандай сұрақтарға жауап бересің?») или прислал бланк на казахском/английском, "
+            "Даже если пользователь написал вопрос на казахском или прислал бланк на казахском/английском, "
             "всё равно верни строго валидный JSON с правильным intent и пиши все текстовые поля (explanation, connections, specialist, sources, answer) СТРОГО НА РУССКОМ ЯЗЫКЕ."
         )
         lang_bottom = ""
@@ -404,7 +420,7 @@ def build_system(u, prev, is_file):
         "Правила:\n"
         f"- values: только {len(CODES)} ключей (число или null). {UNIT_CONVERSION_PROMPT}\n"
         "- ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ НА РАЗМЫТЫХ ФОТО: ничего не выдумывай и НЕ угадывай! Если на фото цифра или название показателя размыты, обрезаны или нечитаемы — ставь null в values, а в поле explanation прямо напиши пользователю, какие именно показатели не удалось распознать из-за размытости снимка (и порекомендуй прислать более чёткое фото).\n"
-        "- extra_markers: прочие чётко читаемые показатели вне базового списка (name, value с ед.), без норм.\n"
+        "- extra_markers: ТОЛЬКО показатели, которых НЕТ среди 28 базовых кодов (CODES), и ТОЛЬКО если их название и значение читаются на 100% чётко. НИКОГДА не записывай в extra_markers показатели из списка 28 базовых маркеров (гемоглобин, эритроциты, MCV, лейкоциты, тромбоциты, СОЭ, ферритин, железо, витамин D, B12, фолиевая, глюкоза, HbA1c, АЛТ, АСТ, билирубин, креатинин, мочевина, общий белок, альбумин, холестерин, ЛПНП, ЛПВП, триглицериды, СРБ, ТТГ, св. Т4) — даже если они размыты!\n"
         f"- {mode}\n"
         "- Для lab: explanation — 4–6 предложений живым человеческим языком о физиологии отклонений, возможных бытовых/физиологических факторах у молодых людей (и нечитаемых показателях, если были) и следующем шаге у врача. "
         "Для нестандартных анализов (не из базовых маркеров крови, когда values все null, а данные в extra_markers) дай краткое безопасное пояснение по назначению анализа и необходимости обсудить референсы бланка с врачом. "
@@ -412,8 +428,8 @@ def build_system(u, prev, is_file):
         "- ДЕТАЛИЗАЦИЯ ИСТОЧНИКОВ (поле sources): привязывай источники к конкретным блокам разбора в 2–3 коротких строках с маркером «•» (например: "
         "«• Физиология маркеров и референсы: Tietz Fundamentals of Clinical Chemistry / Henry's Clinical Diagnosis\\n"
         "• Справочник лабораторных тестов: NIH MedlinePlus (medlineplus.gov/lab-tests)\\n"
-        "• Клинические рекомендации: Клинические протоколы МЗ РК (rcrz.kz) / WHO (who.int)»). "
-        "Используй ТОЛЬКО проверенные источники и базовые домены из списка KNOW (medlineplus.gov/lab-tests, rcrz.kz, who.int). "
+        "• Клинические рекомендации: Клинические протоколы МЗ РК (gov.kz) / WHO (who.int)»). "
+        "Используй ТОЛЬКО проверенные источники и базовые домены из списка KNOW (medlineplus.gov/lab-tests, gov.kz, who.int). "
         "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО придумывать глубокие ссылки (с путями/цифрами), номера страниц или несуществующие приказы. Не пиши заголовок «Источники:» / «Дереккөздер:» в начале поля.\n"
         "- Для question (в поле answer, остальные текстовые поля пустые):\n"
         "  • Если приветствие: тепло поздоровайся и напомни, что готов разобрать бланк (фото, PDF или цифры текстом) либо ответить на вопрос по анализам.\n"
@@ -609,32 +625,65 @@ async def cmd_delete(m: Message):
     delete_user_data(uid)
     await m.answer(L(
         u and u["lang"],
-        "🗑 Профиль мен талдау тарихы өшірілді. Қайта бастау үшін /start басыңыз.",
-        "🗑 Профиль и история анализов удалены. Чтобы начать заново, нажмите /start.",
+        "🗑 Жеке профиліңіз бен талдау тарихыңыз өшірілді. Қайта бастау үшін /start басыңыз.",
+        "🗑 Ваш профиль и история анализов удалены. Чтобы начать заново, нажмите /start.",
     ))
 
 
 @router.message(Command("stats"))
 async def cmd_stats(m: Message):
-    u = get_user(m.from_user.id)
+    uid = m.from_user.id
+    u = get_user(uid)
     lang = (u and u["lang"]) or "kk"
+    if not is_admin(uid):
+        await m.answer(L(
+            lang,
+            "⛔ Бұл команда тек жоба әкімшілеріне қолжетімді.",
+            "⛔ Эта команда доступна только администраторам проекта.",
+        ))
+        return
     st = get_quality_stats()
+    admin_hint = ""
+    if not ADMIN_IDS:
+        admin_hint = (
+            f"\n\n🔐 ID администратора (добавьте в ADMIN_IDS на Render, чтобы закрыть /stats от других): {uid}"
+        )
     await m.answer(L(
         lang,
         f"📊 Сапа және белсенділік статистикасы:\n"
-        f"👥 Барлық қолданушылар: {st['users_total']} (тіркелгені: {st['users_ready']})\n"
+        f"👥 Белсенді профильдер: {st['users_total']} (тіркелгені: {st['users_ready']})\n"
         f"🧪 Жалпы талдаулар: {st['analyses_total']}\n"
         f"📈 Бір қолданушыға орташа талдау: {st['avg_per_user']}\n"
         f"🔁 Қайта жүктеу үлесі (2+ талдау): {st['repeat_pct']}\n"
         f"👍 Позитивті баға үлесі: {st['like_pct']} ({st['fb_up']}/{st['fb_tot']})\n"
-        f"⛔ Тақырыптан тыс бұғаттаулар: {st['blocked_total']}",
+        f"⛔ Тақырыптан тыс бұғаттаулар: {st['blocked_total']}{admin_hint}",
         f"📊 Статистика качества и активности:\n"
-        f"👥 Всего пользователей: {st['users_total']} (завершили профиль: {st['users_ready']})\n"
+        f"👥 Активных профилей: {st['users_total']} (завершили профиль: {st['users_ready']})\n"
         f"🧪 Всего разборов анализов: {st['analyses_total']}\n"
         f"📈 Среднее кол-во анализов на юзера: {st['avg_per_user']}\n"
         f"🔁 Доля пользователей с 2+ анализами: {st['repeat_pct']}\n"
         f"👍 Доля позитивных оценок: {st['like_pct']} ({st['fb_up']}/{st['fb_tot']})\n"
-        f"⛔ Блокировки оффтопа: {st['blocked_total']}",
+        f"⛔ Блокировки оффтопа: {st['blocked_total']}{admin_hint}",
+    ))
+
+
+@router.message(Command("reset_stats"))
+async def cmd_reset_stats(m: Message):
+    uid = m.from_user.id
+    u = get_user(uid)
+    lang = (u and u["lang"]) or "ru"
+    if not ADMIN_IDS or uid not in ADMIN_IDS:
+        await m.answer(L(
+            lang,
+            "⛔ Бұл команда тек ADMIN_IDS тізіміндегі әкімшілерге қолжетімді.",
+            "⛔ Эта команда доступна только администраторам из списка ADMIN_IDS.",
+        ))
+        return
+    reset_all_stats()
+    await m.answer(L(
+        lang,
+        "🧹 Жалпы статистика нөлге түсірілді.",
+        "🧹 Глобальная статистика сброшена.",
     ))
 
 
@@ -740,12 +789,17 @@ async def analyze(m: Message, u, content, is_file, notice="", source_type="lab")
     prev = last_analysis(uid)
     if not is_file:
         prev_vals = load_vals(prev)
-        if prev_vals:
-            user_q = content[0]["text"]
-            content = [{
-                "type": "text",
-                "text": f"[Контекст последнего анализа пользователя: {status_text(prev_vals, u['gender'])}]\nВопрос пользователя: {user_q}",
-            }]
+        user_q = content[0]["text"]
+        lang_prefix = (
+            "[ЖАУАП ТІЛІ: ТЕК ҚАЗАҚ ТІЛІ (lang=kk). Пайдаланушы орысша жазса да, JSON ішіндегі барлық мәтіндік өрістерді 100% ҚАЗАҚ ТІЛІНДЕ жаз!]\n"
+            if lang == "kk" else
+            "[ЯЗЫК ОТВЕТА: СТРОГО РУССКИЙ (lang=ru). Пиши все текстовые поля JSON на русском языке.]\n"
+        )
+        ctx_line = f"[Контекст последнего анализа пользователя: {status_text(prev_vals, u['gender'])}]\n" if prev_vals else ""
+        content = [{
+            "type": "text",
+            "text": f"{lang_prefix}{ctx_line}Сообщение пользователя: {user_q}",
+        }]
     sys_prompt = build_system(u, prev, is_file)
     data = None
     for attempt in range(2):
@@ -1022,11 +1076,10 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="start", description="Тіркелу / Регистрация заново"),
         BotCommand(command="lang", description="Тілді ауыстыру / Сменить язык"),
-        BotCommand(command="stats", description="Статистика"),
         BotCommand(command="help", description="Анықтама / Справка"),
         BotCommand(command="delete", description="Деректерді өшіру / Удалить данные"),
     ])
-    log.info("Bot polling starting (model=%s, markers=%d)", MODEL, len(CODES))
+    log.info("Bot polling starting (model=%s, markers=%d, admins=%d)", MODEL, len(CODES), len(ADMIN_IDS))
     try:
         while True:
             try:

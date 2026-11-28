@@ -26,12 +26,10 @@ def _has_column(table, col):
 
 
 def init_db():
-    # Включаем WAL для безопасной конкурентной работы при фоновых задачах на следующих этапах
     with closing(sqlite3.connect(DB_PATH, timeout=30.0)) as c:
         c.execute("PRAGMA journal_mode=WAL;")
         c.commit()
 
-    # 1. Пользователи (добавляем pending_fb_id для приёма текстового комментария после 👎)
     q("""CREATE TABLE IF NOT EXISTS users(
          user_id INTEGER PRIMARY KEY,
          lang TEXT,
@@ -45,7 +43,6 @@ def init_db():
     if not _has_column("users", "pending_fb_id"):
         q("ALTER TABLE users ADD COLUMN pending_fb_id INTEGER DEFAULT NULL")
 
-    # 2. Анализы (закладываем source_type и raw_summary для будущей единой ленты /history)
     q("""CREATE TABLE IF NOT EXISTS analyses(
          id INTEGER PRIMARY KEY AUTOINCREMENT,
          user_id INTEGER,
@@ -59,7 +56,6 @@ def init_db():
     if not _has_column("analyses", "raw_summary"):
         q("ALTER TABLE analyses ADD COLUMN raw_summary TEXT DEFAULT ''")
 
-    # 3. Обратная связь (оценка + опциональный текстовый комментарий + привязка к разбору)
     q("""CREATE TABLE IF NOT EXISTS feedback(
          id INTEGER PRIMARY KEY AUTOINCREMENT,
          user_id INTEGER,
@@ -75,7 +71,6 @@ def init_db():
     if not _has_column("feedback", "created_at"):
         q("ALTER TABLE feedback ADD COLUMN created_at TEXT DEFAULT ''")
 
-    # 4. Заготовка под Этап 2: Дневник симптомов (/symptoms)
     q("""CREATE TABLE IF NOT EXISTS symptoms(
          id INTEGER PRIMARY KEY AUTOINCREMENT,
          user_id INTEGER,
@@ -88,7 +83,6 @@ def init_db():
     )""")
     q("CREATE INDEX IF NOT EXISTS idx_symptoms_user ON symptoms(user_id, created_at)")
 
-    # 5. Заготовка под Этап 2: Напоминания о пересдаче анализа
     q("""CREATE TABLE IF NOT EXISTS reminders(
          id INTEGER PRIMARY KEY AUTOINCREMENT,
          user_id INTEGER,
@@ -173,8 +167,19 @@ def save_feedback_comment(uid, fb_id, comment_text):
 
 
 def delete_user_data(uid):
-    for table in ("users", "analyses", "feedback", "symptoms", "reminders"):
-        q(f"DELETE FROM {table} WHERE user_id=?", (uid,))
+    # Удаляем профиль и все персональные медицинские данные пользователя,
+    # сохраняя только обезличенные агрегатные счётчики для /stats
+    q("DELETE FROM users WHERE user_id=?", (uid,))
+    q("DELETE FROM symptoms WHERE user_id=?", (uid,))
+    q("DELETE FROM reminders WHERE user_id=?", (uid,))
+    q("UPDATE analyses SET user_id=NULL, values_json='{}', raw_summary='' WHERE user_id=?", (uid,))
+    q("UPDATE feedback SET user_id=NULL WHERE user_id=?", (uid,))
+
+
+def reset_all_stats():
+    q("DELETE FROM analyses")
+    q("DELETE FROM feedback")
+    q("UPDATE users SET offtopic_count=0")
 
 
 def get_quality_stats():
@@ -187,8 +192,8 @@ def get_quality_stats():
     fb_tot = q("SELECT COUNT(*) c FROM feedback")[0]["c"]
     like_pct = f"{round(fb_up * 100 / fb_tot)}%" if fb_tot else "—"
 
-    users_with_an = q("SELECT COUNT(DISTINCT user_id) c FROM analyses")[0]["c"]
-    repeat_users = q("SELECT COUNT(*) c FROM (SELECT user_id FROM analyses GROUP BY user_id HAVING COUNT(*) >= 2)")[0]["c"]
+    users_with_an = q("SELECT COUNT(DISTINCT user_id) c FROM analyses WHERE user_id IS NOT NULL")[0]["c"]
+    repeat_users = q("SELECT COUNT(*) c FROM (SELECT user_id FROM analyses WHERE user_id IS NOT NULL GROUP BY user_id HAVING COUNT(*) >= 2)")[0]["c"]
     repeat_pct = f"{round(repeat_users * 100 / users_with_an)}%" if users_with_an else "—"
     avg_per_user = f"{(analyses_total / users_with_an):.1f}" if users_with_an else "0"
 
